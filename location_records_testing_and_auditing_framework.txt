@@ -1,0 +1,442 @@
+// ============================================================================
+// MAP SPECIFICATION: EXTENDED GEOSPATIAL RESOLUTION, KINEMATIC INTEGRITY,
+//                    AND TOPOLOGICAL DRIFT AUDITING FRAMEWORK
+// Classification: Machine-Readable Functional Map / Fillable Procedure Template
+// Target Use Cases:
+//   - Multi-source spatial consensus (Kalman / weighted centroid fusion)
+//   - Relational graph coordinate propagation (containment, parent-child, anchors)
+//   - Dynamic kinematic feasibility audits (velocity, acceleration, teleportation detection)
+//   - Temporal coordinate decay, historical trail auditing, and geofence boundary checks
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. EXTENDED DATA SCHEMA DEFINITIONS
+// ----------------------------------------------------------------------------
+
+RECORD EllipsoidBounds:
+    semi_major_axis    : FLOAT    // Equatorial radius (a), default WGS84: 6378137.0 m
+    flattening         : FLOAT    // Flattening (f), default WGS84: 1.0 / 298.257223563
+
+RECORD Coordinates3D:
+    latitude           : FLOAT    // Degrees: [-90.0, 90.0]
+    longitude          : FLOAT    // Degrees: [-180.0, 180.0]
+    altitude_msl       : FLOAT    // Elevation above mean sea level in meters
+    horizontal_accuracy: FLOAT    // 1-sigma uncertainty radius in meters
+    vertical_accuracy  : FLOAT    // 1-sigma altitude uncertainty in meters
+    crs                : STRING   // EPSG identifier (e.g., "EPSG:4979" for 3D WGS84)
+
+RECORD KinematicVector:
+    ground_speed_mps   : FLOAT    // Speed over ground (m/s)
+    bearing_degrees    : FLOAT    // Azimuth / course [0.0, 360.0)
+    vertical_speed_mps : FLOAT    // Climb/sink rate (m/s)
+    max_capable_speed  : FLOAT    // Physical theoretical speed limit for entity (m/s)
+
+RECORD SpatialObservation:
+    observation_id     : IDENTIFIER
+    coordinates        : Coordinates3D
+    kinematics         : OPTIONAL KinematicVector
+    source_type        : ENUM { 
+                             GNSS_RAW, 
+                             CELL_TOWER_TRILATERATION, 
+                             WIFI_BSSID_FINGERPRINT, 
+                             TOPOLOGICAL_CONTAINMENT, 
+                             NETWORK_IP_BGP, 
+                             MANUAL_OVERRIDE 
+                         }
+    source_weight      : FLOAT    // Statistical prior weight [0.0, 1.0]
+    timestamp_utc      : TIMESTAMP
+
+RECORD GeofencePolygon:
+    polygon_id         : IDENTIFIER
+    vertices           : LIST<Coordinates3D>
+    fence_type         : ENUM { INCLUSION_MANDATORY, EXCLUSION_FORBIDDEN }
+
+RECORD AuditVerdict:
+    entity_id          : IDENTIFIER
+    evaluation_time    : TIMESTAMP
+    spatial_status     : ENUM { 
+                             CONCORDANT, 
+                             TOLERABLE_DRIFT, 
+                             KINEMATIC_VIOLATION, 
+                             CONTAINMENT_BREACH, 
+                             SOURCE_CONFLICT 
+                         }
+    delta_euclidean_m  : FLOAT
+    implied_speed_mps  : FLOAT
+    observed_vs_allowed: MAP<STRING, ANY>
+    remedy_instruction : ENUM { ACCEPT_AND_RECENTER, QUARANTINE_NEW, REVERT_TO_PREVIOUS }
+
+
+// ----------------------------------------------------------------------------
+// 2. MATHEMATICAL & GEODETIC UTILITIES
+// ----------------------------------------------------------------------------
+
+FUNCTION ToECEF(coord: Coordinates3D) -> TUPLE<FLOAT, FLOAT, FLOAT>:
+    """
+    Converts geodetic coordinates (lat, lon, h) to Earth-Centered, Earth-Fixed (ECEF) X, Y, Z.
+    """
+    CONSTANT a = 6378137.0
+    CONSTANT f = 1.0 / 298.257223563
+    e_sq = 2.0 * f - (f * f)
+
+    lat_rad = ToRadians(coord.latitude)
+    lon_rad = ToRadians(coord.longitude)
+    sin_lat = Sin(lat_rad)
+    cos_lat = Cos(lat_rad)
+
+    N = a / Sqrt(1.0 - (e_sq * sin_lat * sin_lat))
+
+    X = (N + coord.altitude_msl) * cos_lat * Cos(lon_rad)
+    Y = (N + coord.altitude_msl) * cos_lat * Sin(lon_rad)
+    Z = (N * (1.0 - e_sq) + coord.altitude_msl) * sin_lat
+
+    RETURN (X, Y, Z)
+END FUNCTION
+
+
+FUNCTION Compute3DDistance(coord1: Coordinates3D, coord2: Coordinates3D) -> FLOAT:
+    """
+    Computes strict 3D Euclidean distance using ECEF cartesian transformation.
+    """
+    (x1, y1, z1) = ToECEF(coord1)
+    (x2, y2, z2) = ToECEF(coord2)
+    RETURN Sqrt((x2 - x1)^2 + (y2 - y1)^2 + (z2 - z1)^2)
+END FUNCTION
+
+
+FUNCTION RayCastingPointInPolygon(point: Coordinates3D, poly: GeofencePolygon) -> BOOLEAN:
+    """
+    Ray-casting algorithm over 2D planar projection of polygon vertices.
+    """
+    inside = FALSE
+    n = Length(poly.vertices)
+    j = n - 1
+
+    FOR i FROM 0 TO n - 1:
+        v_i = poly.vertices[i]
+        v_j = poly.vertices[j]
+
+        intersect = ((v_i.longitude > point.longitude) != (v_j.longitude > point.longitude)) AND
+                    (point.latitude < (v_j.latitude - v_i.latitude) * 
+                    (point.longitude - v_i.longitude) / (v_j.longitude - v_i.longitude) + v_i.latitude)
+        
+        IF intersect:
+            inside = NOT inside
+        j = i
+    ENDFOR
+
+    RETURN inside
+END FUNCTION
+
+
+// ----------------------------------------------------------------------------
+// 3. MULTI-SOURCE FUSION & SPATIAL PROPAGATION PROCEDURES
+// ----------------------------------------------------------------------------
+
+PROCEDURE FuseMultiSourceObservations(observations: LIST<SpatialObservation>) -> SpatialObservation:
+    """
+    Fuses multiple concurrent or near-concurrent coordinate claims into a single 
+    maximum-likelihood spatial estimate using inverse-variance and source weighting.
+    """
+    IF Length(observations) == 0:
+        THROW InvalidArgumentException("Cannot fuse empty observation set.")
+
+    total_weight = 0.0
+    accum_x = 0.0
+    accum_y = 0.0
+    accum_z = 0.0
+    accum_var_h = 0.0
+    latest_ts = observations[0].timestamp_utc
+
+    FOR EACH obs IN observations:
+        // Weight inversely proportional to accuracy variance, modulated by source reliability
+        variance = Max(obs.coordinates.horizontal_accuracy^2, 1.0)
+        weight = obs.source_weight * (1.0 / variance)
+
+        (x, y, z) = ToECEF(obs.coordinates)
+        accum_x = accum_x + (x * weight)
+        accum_y = accum_y + (y * weight)
+        accum_z = accum_z + (z * weight)
+        accum_var_h = accum_var_h + (1.0 / weight)
+        total_weight = total_weight + weight
+
+        IF obs.timestamp_utc > latest_ts:
+            latest_ts = obs.timestamp_utc
+    ENDFOR
+
+    fused_x = accum_x / total_weight
+    fused_y = accum_y / total_weight
+    fused_z = accum_z / total_weight
+    fused_accuracy = Sqrt(accum_var_h / Length(observations))
+
+    // ECEF to Geodetic Reverse Conversion
+    CONSTANT a = 6378137.0
+    CONSTANT f = 1.0 / 298.257223563
+    e_sq = 2.0 * f - (f * f)
+
+    p = Sqrt(fused_x^2 + fused_y^2)
+    theta = Atan2(fused_z * a, p * (1.0 - f) * a)
+    
+    lat = Atan2(fused_z + e_sq * (1.0 - f) * a * Sin(theta)^3, 
+                p - e_sq * a * Cos(theta)^3)
+    lon = Atan2(fused_y, fused_x)
+    N = a / Sqrt(1.0 - e_sq * Sin(lat)^2)
+    alt = (p / Cos(lat)) - N
+
+    fused_coords = Coordinates3D(
+        latitude = ToDegrees(lat),
+        longitude = ToDegrees(lon),
+        altitude_msl = alt,
+        horizontal_accuracy = fused_accuracy,
+        vertical_accuracy = fused_accuracy * 1.5,
+        crs = "EPSG:4979"
+    )
+
+    RETURN SpatialObservation(
+        observation_id = GenerateUUID(),
+        coordinates = fused_coords,
+        kinematics = NULL,
+        source_type = TOPOLOGICAL_CONTAINMENT,
+        source_weight = Min(total_weight, 1.0),
+        timestamp_utc = latest_ts
+    )
+END PROCEDURE
+
+
+PROCEDURE PropagateRelationalGraphLocation(entity_id: IDENTIFIER, max_depth: INTEGER = 3) -> OPTIONAL Coordinates3D:
+    """
+    Recursively resolves spatial coordinates down dependency and containment chains:
+      Child -> ContainedIn (Room -> Floor -> Building -> Parcel)
+      Asset -> MountedOn (Vehicle/Platform)
+    """
+    IF max_depth <= 0:
+        RETURN NULL
+
+    edges = QueryOutboundGraphEdges(entity_id)
+
+    // Strategy 1: Explicit hard containment hierarchy
+    FOR EACH edge IN edges WHERE edge.type IN ["CONTAINED_IN", "LOCATED_AT", "MOUNTED_ON"]:
+        parent = FetchEntityRecord(edge.target_id)
+        IF parent.recorded_location IS NOT NULL:
+            RETURN parent.recorded_location.coordinates
+        
+        // Recursive step up the graph
+        parent_coords = PropagateRelationalGraphLocation(parent.id, max_depth - 1)
+        IF parent_coords IS NOT NULL:
+            RETURN parent_coords
+    ENDFOR
+
+    // Strategy 2: Proximity anchor consensus (e.g., fixed beacon anchors)
+    connected_anchors = []
+    FOR EACH edge IN edges WHERE edge.type == "CONNECTED_TO":
+        peer = FetchEntityRecord(edge.target_id)
+        IF peer.is_fixed_anchor AND peer.recorded_location IS NOT NULL:
+            connected_anchors.Append(peer.recorded_location)
+    ENDFOR
+
+    IF Length(connected_anchors) >= 3:
+        RETURN FuseMultiSourceObservations(connected_anchors).coordinates
+
+    RETURN NULL
+END PROCEDURE
+
+
+// ----------------------------------------------------------------------------
+// 4. EXTENDED AUDITING PROCEDURES: DRIFT, KINEMATICS & CONTAINMENT
+// ----------------------------------------------------------------------------
+
+PROCEDURE ExecuteKinematicIntegrityAudit(
+    entity_id: IDENTIFIER,
+    baseline: SpatialObservation,
+    candidate: SpatialObservation,
+    max_system_acceleration: FLOAT = 9.8 // Max physical acceleration in m/s^2
+) -> AuditVerdict:
+    """
+    Evaluates candidate spatial coordinates against existing historical baseline 
+    using physics constraints to prevent teleportation, sensor artifacts, and spoofing.
+    """
+    delta_t_seconds = Absolute(candidate.timestamp_utc - baseline.timestamp_utc)
+    delta_distance_m = Compute3DDistance(baseline.coordinates, candidate.coordinates)
+
+    // Prevent divide-by-zero on simultaneous read races
+    IF delta_t_seconds < 0.001:
+        IF delta_distance_m > (baseline.coordinates.horizontal_accuracy + candidate.coordinates.horizontal_accuracy):
+            RETURN AuditVerdict(
+                entity_id = entity_id,
+                evaluation_time = CurrentTimestamp(),
+                spatial_status = SOURCE_CONFLICT,
+                delta_euclidean_m = delta_distance_m,
+                implied_speed_mps = INFINITY,
+                observed_vs_allowed = {"error": "Zero-time delta with non-overlapping bounds"},
+                remedy_instruction = QUARANTINE_NEW
+            )
+        ELSE:
+            RETURN AuditVerdict(
+                entity_id = entity_id,
+                evaluation_time = CurrentTimestamp(),
+                spatial_status = CONCORDANT,
+                delta_euclidean_m = delta_distance_m,
+                implied_speed_mps = 0.0,
+                observed_vs_allowed = {"note": "Simultaneous co-located observations"},
+                remedy_instruction = ACCEPT_AND_RECENTER
+            )
+    ENDIF
+
+    implied_speed = delta_distance_m / delta_t_seconds
+    entity_profile = GetEntityKinematicProfile(entity_id)
+    rated_speed_limit = entity_profile.max_capable_speed
+
+    // Kinematic check 1: Speed exceeds entity physical envelope
+    IF implied_speed > rated_speed_limit:
+        RETURN AuditVerdict(
+            entity_id = entity_id,
+            evaluation_time = CurrentTimestamp(),
+            spatial_status = KINEMATIC_VIOLATION,
+            delta_euclidean_m = delta_distance_m,
+            implied_speed_mps = implied_speed,
+            observed_vs_allowed = {
+                "allowed_speed_mps": rated_speed_limit,
+                "observed_speed_mps": implied_speed
+            },
+            remedy_instruction = QUARANTINE_NEW
+        )
+
+    // Kinematic check 2: Excessive acceleration over baseline vector
+    IF baseline.kinematics IS NOT NULL:
+        speed_delta = Absolute(implied_speed - baseline.kinematics.ground_speed_mps)
+        implied_acceleration = speed_delta / delta_t_seconds
+
+        IF implied_acceleration > max_system_acceleration:
+            RETURN AuditVerdict(
+                entity_id = entity_id,
+                evaluation_time = CurrentTimestamp(),
+                spatial_status = KINEMATIC_VIOLATION,
+                delta_euclidean_m = delta_distance_m,
+                implied_speed_mps = implied_speed,
+                observed_vs_allowed = {
+                    "max_accel": max_system_acceleration,
+                    "computed_accel": implied_acceleration
+                },
+                remedy_instruction = QUARANTINE_NEW
+            )
+    ENDIF
+
+    // Tolerable drift analysis based on standard deviations
+    total_tolerance = baseline.coordinates.horizontal_accuracy + 
+                      candidate.coordinates.horizontal_accuracy
+
+    IF delta_distance_m <= total_tolerance:
+        status = CONCORDANT
+    ELSE:
+        status = TOLERABLE_DRIFT
+
+    RETURN AuditVerdict(
+        entity_id = entity_id,
+        evaluation_time = CurrentTimestamp(),
+        spatial_status = status,
+        delta_euclidean_m = delta_distance_m,
+        implied_speed_mps = implied_speed,
+        observed_vs_allowed = {"budget_m": total_tolerance, "actual_m": delta_distance_m},
+        remedy_instruction = ACCEPT_AND_RECENTER
+    )
+END PROCEDURE
+
+
+PROCEDURE AuditGeofenceBoundaries(
+    entity_id: IDENTIFIER, 
+    coords: Coordinates3D, 
+    assigned_fences: LIST<GeofencePolygon>
+) -> LIST<AuditVerdict>:
+    """
+    Evaluates coordinates against geographic policy envelopes (forbidden zones, containment perimeters).
+    """
+    verdicts = []
+
+    FOR EACH fence IN assigned_fences:
+        is_inside = RayCastingPointInPolygon(coords, fence)
+
+        IF fence.fence_type == INCLUSION_MANDATORY AND NOT is_inside:
+            verdicts.Append(AuditVerdict(
+                entity_id = entity_id,
+                evaluation_time = CurrentTimestamp(),
+                spatial_status = CONTAINMENT_BREACH,
+                delta_euclidean_m = 0.0,
+                implied_speed_mps = 0.0,
+                observed_vs_allowed = {"fence_id": fence.polygon_id, "violation": "OUTSIDE_INCLUSION"},
+                remedy_instruction = REVERT_TO_PREVIOUS
+            ))
+        ELSE IF fence.fence_type == EXCLUSION_FORBIDDEN AND is_inside:
+            verdicts.Append(AuditVerdict(
+                entity_id = entity_id,
+                evaluation_time = CurrentTimestamp(),
+                spatial_status = CONTAINMENT_BREACH,
+                delta_euclidean_m = 0.0,
+                implied_speed_mps = 0.0,
+                observed_vs_allowed = {"fence_id": fence.polygon_id, "violation": "INSIDE_EXCLUSION"},
+                remedy_instruction = QUARANTINE_NEW
+            ))
+    ENDFOR
+
+    RETURN verdicts
+END PROCEDURE
+
+
+// ----------------------------------------------------------------------------
+// 5. MASTER INTEGRATION PIPELINE
+// ----------------------------------------------------------------------------
+
+PROCEDURE ExecuteMasterLocationAuditWorkflow(entity_id: IDENTIFIER, incoming_claims: LIST<SpatialObservation>):
+    """
+    End-to-end ingestion orchestrator:
+      1. Resolves candidate coordinates (fusing observations or propagating relational graph).
+      2. Validates against historical recorded baseline.
+      3. Verifies kinematic limits and spatial geofences.
+      4. Commits updates or emits audit containment logs.
+    """
+    entity = FetchEntityRecord(entity_id)
+
+    // Step 1: Candidate Resolution
+    candidate_observation = NULL
+    IF Length(incoming_claims) > 0:
+        candidate_observation = FuseMultiSourceObservations(incoming_claims)
+    ELSE:
+        propagated_coords = PropagateRelationalGraphLocation(entity_id)
+        IF propagated_coords IS NOT NULL:
+            candidate_observation = SpatialObservation(
+                observation_id = GenerateUUID(),
+                coordinates = propagated_coords,
+                kinematics = NULL,
+                source_type = TOPOLOGICAL_CONTAINMENT,
+                source_weight = 0.5,
+                timestamp_utc = CurrentTimestamp()
+            )
+        ELSE:
+            LogAuditFailure(entity_id, "UNABLE_TO_LOCATE", "No direct signals or graph anchors available.")
+            RETURN
+    ENDIF
+
+    // Step 2: Kinematic Verification against Baseline
+    IF entity.recorded_location IS NOT NULL:
+        verdict = ExecuteKinematicIntegrityAudit(
+            entity_id = entity_id,
+            baseline = entity.recorded_location,
+            candidate = candidate_observation
+        )
+
+        IF verdict.remedy_instruction == QUARANTINE_NEW:
+            QuarantineLocationClaim(entity_id, candidate_observation, verdict)
+            RETURN
+    ENDIF
+
+    // Step 3: Geofence and Boundary Policy Verification
+    fences = GetEntityAssignedGeofences(entity_id)
+    fence_breaches = AuditGeofenceBoundaries(entity_id, candidate_observation.coordinates, fences)
+
+    IF Length(fence_breaches) > 0:
+        TriggerSecurityContainment(entity_id, fence_breaches)
+        RETURN
+
+    // Step 4: State Transition & Commit
+    WriteCoordinateAuditTrail(entity_id, candidate_observation)
+    UpdateEntityRecordLocation(entity_id, candidate_observation)
+END PROCEDURE
